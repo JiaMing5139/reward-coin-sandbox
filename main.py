@@ -22,6 +22,7 @@ import numpy as np
 
 from sandbox import Sandbox, COINS, OBS_KEYS, CONFIG
 from model import MLP
+from reward import reward_fn
 
 # ----------------------------------------------------------------------
 # 全局配置
@@ -69,15 +70,16 @@ def run_episodes(box, n_users, policy_fn, rng, collect=False):
     obs = box.reset(n_users)
     step_obs, step_coins, step_reward, step_next, step_done, step_active = [], [], [], [], [], []
     while box.alive.any():
-        active = box.alive.copy()
         coins = policy_fn(obs)
         obs_now = obs
-        obs, reward, done, info = box.step(coins)
+        obs, info, done = box.step(coins)
+        active = info["active"].astype(bool)
+        reward = reward_fn(info)
         step_obs.append(obs_now)
         step_coins.append(np.asarray(coins, float))
         step_reward.append(reward)
-        step_next.append(obs)              # s' (下一步观测)
-        step_done.append(done)             # 该步后 episode 是否结束
+        step_next.append(obs)
+        step_done.append(done)
         step_active.append(active)
 
     T = len(step_reward)
@@ -189,14 +191,30 @@ def main():
             best_c = np.where(upd, c, best_c)
         return best_c
 
-    # 短视真值策略 (myopic): 每步用上帝单步利润挑最优, 不顾未来
+    # 短视真值策略 (myopic): 每步用上帝真值规则估【单步期望利润】挑最优, 不顾未来。
+    # 用 world 真值 + obs 里的市场摘要(胜出广告属性/成交价)估单步利润。
+    from world import World as _World
+    _w = _World()
+    win_bid_i  = OBS_KEYS.index("win_bid")
+    win_typ_i  = OBS_KEYS.index("win_type")
+    win_ext_i  = OBS_KEYS.index("win_ext_ecpm")
+    second_i   = OBS_KEYS.index("second_ecpm")
+    ltv_i      = OBS_KEYS.index("u_ltv")
+    sens_i     = OBS_KEYS.index("u_sens")
+
     def myopic_policy(obs):
         n = len(obs)
-        f = {k: obs[:, i] for i, k in enumerate(OBS_KEYS)}
-        best_c = np.zeros(n); best_q = np.full(n, -1e9)
         budget = obs[:, BUDGET_IDX]
+        # 重建胜出广告真值特征(用于真实 pCTR/观看)
+        f = {"u_ltv": obs[:, ltv_i], "u_sens": obs[:, sens_i],
+             "g_ctr": obs[:, win_bid_i] * 0 + 0.18}   # g_ctr 不在 obs, 用均值近似
+        atype = obs[:, win_typ_i]
+        rev = np.where(atype == 0, obs[:, second_i], obs[:, win_ext_i])
+        best_c = np.zeros(n); best_q = np.full(n, -1e9)
         for c in COINS:
-            q = box.immediate_profit(f, np.full(n, c))
+            cc = np.full(n, c)
+            watch = _w.watch_prob(f, cc)
+            q = watch * (rev - CONFIG["coin_cost"] * cc)   # 单步期望利润(近似)
             q = np.where(c <= budget, q, -1e9)
             upd = q > best_q
             best_q = np.where(upd, q, best_q); best_c = np.where(upd, c, best_c)
